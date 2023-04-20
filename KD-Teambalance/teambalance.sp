@@ -1,130 +1,145 @@
 #include <sourcemod>
-#include <cstrike>
+#include <sdktools>
 
-public Plugin myinfo =
-{
-	name = "Team Balance (K/D based)",
-	author = "TwójNick",
-	description = "Utrzymuje równowagę drużyn na serwerze CS:GO na podstawie K/D graczy",
-	version = "1.0",
-	url = ""
-};
+ArrayList teamT = new ArrayList();
+ArrayList teamCT = new ArrayList();
 
-// Ustawienia domyślne
-float g_fBalanceThreshold = 0.5;
+Dictionary lastSwitched = new Dictionary();
+int currentRound = 1;
 
 public void OnPluginStart()
 {
-	LoadConfig();
-	HookEvent("round_end", Event_RoundEnd);
-	HookEvent("round_start", Event_RoundStart);
+	RegConsoleCmd("sm_teambalance", Command_TeamBalance, "Balance teams based on K/D ratio");
 }
 
-public void LoadConfig()
+public void OnClientPutInServer(int client)
 {
-	char configPath[PLATFORM_MAX_PATH];
-	BuildPath(Path_SM, configPath, sizeof(configPath), "configs/team_balance.cfg");
-
-	KeyValues kv = new KeyValues("TeamBalanceSettings");
-	if (kv.LoadFromFile(configPath) == false)
-	{
-		LogError("Nie można załadować pliku konfiguracyjnego: %s", configPath);
-		return;
-	}
-
-	g_fBalanceThreshold = kv.GetNum("balance_threshold", 0.5);
-	kv.Close();
+	UpdatePlayerTeam(client);
 }
 
-public void Event_RoundEnd(Event event, const char[] name, bool dontBroadcast)
+public void OnClientDisconnect(int client)
 {
-	int lowestKDClient = -1;
-	float lowestKD = 99999.0;
-	int teamToSwitch = -1;
+	teamT.Remove(client);
+	teamCT.Remove(client);
+	lastSwitched.Delete(client);
+}
 
-	for (int i = 1; i <= MaxClients; i++)
+public Action Command_TeamBalance(int client, int args)
+{
+	// Update player teams before performing balance check
+	UpdateAllPlayerTeams();
+
+	ArrayList playersToSwitch = OptimizePlayerSwitch(teamT, teamCT);
+
+	if (playersToSwitch.Length == 0)
 	{
-		if (!IsValidClient(i) || GetClientTeam(i) == CS_TEAM_SPECTATOR)
-			continue;
-
-		int kills = CS_GetClientKills(i);
-		int deaths = CS_GetClientDeaths(i);
-		float kdr = (deaths > 0) ? float(kills) / float(deaths) : 0.0;
-
-		if (kdr < lowestKD)
-		{
-			lowestKD = kdr;
-			lowestKDClient = i;
-			teamToSwitch = GetClientTeam(i) == CS_TEAM_T ? CS_TEAM_CT : CS_TEAM_T;
-		}
+		PrintToChat(client, "Teams are already balanced.");
+		return Plugin_Handled;
 	}
-	if (lowestKDClient != -1 && IsValidClient(lowestKDClient))
+
+	int playerT = playersToSwitch.Get(0);
+	int playerCT = playersToSwitch.Get(1);
+
+	ChangeClientTeam(playerT, "CT");
+	ChangeClientTeam(playerCT, "T");
+
+	PrintToChatAll("Teams have been balanced. %s and %s have been switched.", GetClientName(playerT), GetClientName(playerCT));
+
+	return Plugin_Handled;
+}
+public void UpdatePlayerTeam(int client)
+{
+	char team[32];
+	GetClientTeam(client, team, sizeof(team));
+
+	if (StrEqual(team, "T") || StrEqual(team, "CT"))
 	{
-		if (teamToSwitch == CS_TEAM_T)
+		// Remove player from both lists to avoid duplicates
+		teamT.Remove(client);
+		teamCT.Remove(client);
+
+		if (StrEqual(team, "T"))
 		{
-			if (AverageKDR(CS_TEAM_CT) - AverageKDR(CS_TEAM_T) > g_fBalanceThreshold)
-			{
-				ChangeClientTeam(lowestKDClient, CS_TEAM_T);
-				FreezeClient(lowestKDClient, true);
-				ReplyToCommand(lowestKDClient, "Zostałeś przeniesiony do drużyny T, aby utrzymać równowagę drużyn.");
-			}
+			teamT.Push(client);
 		}
-		else if (teamToSwitch == CS_TEAM_CT)
+		else
 		{
-			if (AverageKDR(CS_TEAM_T) - AverageKDR(CS_TEAM_CT) > g_fBalanceThreshold)
-			{
-				ChangeClientTeam(lowestKDClient, CS_TEAM_CT);
-				FreezeClient(lowestKDClient, true);
-				ReplyToCommand(lowestKDClient, "Zostałeś przeniesiony do drużyny CT, aby utrzymać równowagę drużyn.");
-			}
+			teamCT.Push(client);
 		}
 	}
 }
 
-public void Event_RoundStart(Event event, const char[] name, bool dontBroadcast)
+public void UpdateAllPlayerTeams()
 {
-	for (int i = 1; i <= MaxClients; i++)
+	for (int client = 1; client <= MaxClients; client++)
 	{
-		if (IsValidClient(i))
+		if (IsClientInGame(client))
 		{
-			FreezeClient(i, false);
+			UpdatePlayerTeam(client);
 		}
 	}
 }
 
-bool IsValidClient(int client)
+public float AverageKDR(ArrayList team)
 {
-	return client > 0 && client <= MaxClients && IsClientConnected(client) && !IsClientSourceTV(client) && !IsClientReplay(client);
+	float totalKDR = 0.0;
+
+	for (int i = 0; i < team.Length; i++)
+	{
+		int client = team.Get(i);
+		int kills = GetClientStat(client, "kills");
+		int deaths = GetClientStat(client, "deaths");
+
+		totalKDR += (float)kills / max(deaths, 1);
+	}
+
+	return totalKDR / team.Length;
 }
 
-void FreezeClient(int client, bool freeze)
+public int GetClientStat(int client, const char[] stat)
 {
-	if (freeze)
-	{
-		SetEntProp(client, Prop_Send, "m_fFlags", GetEntProp(client, Prop_Send, "m_fFlags") | FL_FROZEN);
-	}
-	else
-	{
-		SetEntProp(client, Prop_Send, "m_fFlags", GetEntProp(client, Prop_Send, "m_fFlags") & ~FL_FROZEN);
-	}
+	char command[32];
+	Format(command, sizeof(command), "sm_stats_get_%s", stat);
+
+	return RunCommand(client, command);
 }
 
-float AverageKDR(int team)
+public void ChangeClientTeam(int client, const char[] team)
 {
-	int teamSize = 0;
-	float teamKDRSum = 0.0;
+	char command[32];
+	Format(command, sizeof(command), "sm_changename %s", team);
 
-	for (int i = 1; i <= MaxClients; i++)
+	RunCommand(client, command);
+}
+
+public int RunCommand(int client, const char[] command)
+{
+	FakeClientCommand(client, command);
+	return GetCmdReply();
+}
+
+public Action OnRoundEnd(Handle event, const char[] name, bool dontBroadcast)
+{
+	// Update player teams before performing balance check
+	UpdateAllPlayerTeams();
+
+	ArrayList playersToSwitch = OptimizePlayerSwitch(teamT, teamCT);
+
+	if (playersToSwitch.Length != 0)
 	{
-		if (IsValidClient(i) && GetClientTeam(i) == team)
-		{
-			teamSize++;
-			int kills = CS_GetClientKills(i);
-			int deaths = CS_GetClientDeaths(i);
-			float kdr = (deaths > 0) ? float(kills) / float(deaths) : 0.0;
-			teamKDRSum += kdr;
-		}
-	}
+		int playerT = playersToSwitch.Get(0);
+		int playerCT = playersToSwitch.Get(1);
 
-	return (teamSize > 0) ? teamKDRSum / float(teamSize) : 0.0;
+		ChangeClientTeam(playerT, "CT");
+		ChangeClientTeam(playerCT, "T");
+
+		lastSwitched.SetValue(playerT, currentRound);
+		lastSwitched.SetValue(playerCT, currentRound);
+
+		// Make sure switched players cannot be killed or kill others until next round
+		SDKHooks_AddClientImmunity(client, AdminId:0, immunityflags:0);
+		SDKHooks_AddClientImmunity(client, AdminId:0, immunityflags:0);
+	}
+	currentRound++;
+	return Plugin_Continue;
 }
